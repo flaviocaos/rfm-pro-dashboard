@@ -1,333 +1,482 @@
-"""
-================================================================
- TCC — Segmentação de Clientes com Autoencoders e KMeans
- Pós-Graduação em Deep Learning — UFPE
- Dataset: UCI Online Retail II
- Resultados validados: Silhouette=0.3992 | DBI=0.7382
-================================================================
-"""
+import { useState, useEffect, useRef } from "react";
 
-# 1. Instalar dependências
-import subprocess
-subprocess.run(["pip", "install", "openpyxl", "-q"])
+const SEGS = {
+  VIP:        { hex:"#8b5cf6", bg:"#f5f3ff", tx:"#4c1d95", emoji:"👑", desc:"Alto valor, alta freq., recente" },
+  Leal:       { hex:"#10b981", bg:"#ecfdf5", tx:"#064e3b", emoji:"💎", desc:"Frequência média-alta, bom valor" },
+  "Em Risco": { hex:"#f59e0b", bg:"#fffbeb", tx:"#78350f", emoji:"⚠️", desc:"Foram bons, recência caindo" },
+  Inativo:    { hex:"#ef4444", bg:"#fef2f2", tx:"#7f1d1d", emoji:"💤", desc:"Baixa freq., baixo valor" },
+  Novo:       { hex:"#3b82f6", bg:"#eff6ff", tx:"#1e3a8a", emoji:"🌱", desc:"Poucas compras, potencial alto" },
+};
+const SK = Object.keys(SEGS);
+const CHURN_MAP = {"#8b5cf6":0.05,"#10b981":0.15,"#f59e0b":0.55,"#ef4444":0.80,"#3b82f6":0.30};
 
-# 2. Importações
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
-warnings.filterwarnings("ignore")
+const fR = v => `R$ ${(v||0).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+const fN = v => (v||0).toLocaleString("pt-BR");
+const fK = v => v>=1000000?`${(v/1000000).toFixed(1)}M`:v>=1000?`${(v/1000).toFixed(1)}k`:String(Math.round(v||0));
 
-import tensorflow as tf
-from tensorflow.keras import layers, Model, callbacks
-from tensorflow.keras.optimizers import Adam
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, davies_bouldin_score
-from sklearn.manifold import TSNE
+function genRows(n=180){
+  const now=new Date("2024-12-31"),out=[];
+  const profiles=[
+    {recRange:[1,30],freqRange:[8,20],valRange:[2000,15000],weight:15},
+    {recRange:[1,90],freqRange:[4,12],valRange:[800,5000],weight:25},
+    {recRange:[90,200],freqRange:[3,8],valRange:[500,3000],weight:20},
+    {recRange:[200,365],freqRange:[1,3],valRange:[50,500],weight:25},
+    {recRange:[1,60],freqRange:[1,3],valRange:[100,1000],weight:15},
+  ];
+  const totalW=profiles.reduce((a,p)=>a+p.weight,0);
+  for(let i=1;i<=n;i++){
+    let rnd=Math.random()*totalW,prof=profiles[0];
+    for(const p of profiles){rnd-=p.weight;if(rnd<=0){prof=p;break;}}
+    const purchases=Math.floor(Math.random()*(prof.freqRange[1]-prof.freqRange[0]))+prof.freqRange[0];
+    for(let j=0;j<purchases;j++){
+      const d=Math.floor(Math.random()*(prof.recRange[1]-prof.recRange[0]))+prof.recRange[0];
+      out.push({
+        customer_id:`C${String(i).padStart(4,"0")}`,
+        purchase_date:new Date(now-(d+Math.floor(Math.random()*60))*864e5).toISOString().slice(0,10),
+        purchase_value:parseFloat((Math.random()*(prof.valRange[1]-prof.valRange[0])+prof.valRange[0]).toFixed(2))
+      });
+    }
+  }
+  return out;
+}
 
-SEED = 42
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
-print(f"✅ TensorFlow: {tf.__version__}")
-print(f"✅ Bibliotecas carregadas com sucesso!")
+function buildClients(rows,k=5){
+  const map={},now=new Date("2024-12-31");
+  rows.forEach(r=>{
+    const id=r.customer_id,d=new Date(r.purchase_date);
+    if(!map[id])map[id]={id,last:d,freq:0,mon:0};
+    if(d>map[id].last)map[id].last=d;
+    map[id].freq++;map[id].mon+=r.purchase_value;
+  });
+  let arr=Object.values(map).map(c=>({...c,rec:Math.floor((now-c.last)/864e5),mon:parseFloat(c.mon.toFixed(2))}));
+  const nm=(a,key)=>{const vs=a.map(x=>x[key]),mn=Math.min(...vs),mx=Math.max(...vs);return a.map(x=>({...x,[key+"_n"]:mx===mn?.5:(x[key]-mn)/(mx-mn)}));};
+  arr=nm(arr,"rec");arr=nm(arr,"freq");arr=nm(arr,"mon");
+  arr=arr.map(c=>({...c,rn:1-c.rec_n,fn:c.freq_n,mn2:c.mon_n}));
+  arr=nm(arr,"rn");arr=nm(arr,"fn");arr=nm(arr,"mn2");
+  let cents=arr.slice(0,k).map(d=>({r:d.rn_n,f:d.fn_n,m:d.mn2_n})),asgn=arr.map(()=>0);
+  for(let it=0;it<50;it++){
+    asgn=arr.map(d=>{let b=0,bd=Infinity;cents.forEach((c,ci)=>{const dist=(d.rn_n-c.r)**2+(d.fn_n-c.f)**2+(d.mn2_n-c.m)**2;if(dist<bd){bd=dist;b=ci;}});return b;});
+    cents=Array.from({length:k},(_,ci)=>{const pts=arr.filter((_,i)=>asgn[i]===ci);if(!pts.length)return cents[ci];return{r:pts.reduce((s,p)=>s+p.rn_n,0)/pts.length,f:pts.reduce((s,p)=>s+p.fn_n,0)/pts.length,m:pts.reduce((s,p)=>s+p.mn2_n,0)/pts.length};});
+  }
+  const sc=v=>v>=.75?5:v>=.5?4:v>=.35?3:v>=.2?2:1;
+  const sg=(r,f,m)=>r>=4&&f>=4&&m>=4?"VIP":(r+f+m)/3>=3.5?"Leal":r<=2&&(f>=3||m>=3)?"Em Risco":f<=2&&m<=2?"Inativo":"Novo";
+  return arr.map((c,i)=>{
+    const rs=sc(c.rn_n),fs=sc(c.fn_n),ms=sc(c.mn2_n),seg=sg(rs,fs,ms);
+    const base=CHURN_MAP[SEGS[seg].hex]||0.3;
+    return{...c,cluster:asgn[i],rs,fs,ms,segment:seg,churn:Math.min(1,Math.max(0,base+(Math.random()-.5)*.08)).toFixed(2)};
+  });
+}
 
-# ── 3. Carregamento e pré-processamento ──────────────────────────
+function parseCSV(txt){
+  const lines=txt.trim().split("\n"),h=lines[0].split(",").map(x=>x.trim().toLowerCase().replace(/\s+/g,"_"));
+  return lines.slice(1).map(l=>{const v=l.split(","),o={};h.forEach((k,i)=>o[k]=v[i]?.trim());o.purchase_value=parseFloat(o.purchase_value)||0;return o;}).filter(r=>r.customer_id&&r.purchase_date&&r.purchase_value>0);
+}
 
-def load_and_preprocess(path):
-    """
-    Carrega o dataset UCI Online Retail II e aplica filtros de qualidade.
-    Compatível com colunas: Invoice, StockCode, Description, Quantity,
-    InvoiceDate, Price, Customer ID, Country.
-    """
-    print("\n📂 Carregando dataset...")
-    df = pd.read_excel(path, sheet_name="Year 2010-2011", engine="openpyxl")
-    print(f"   Shape original: {df.shape}")
-    print(f"   Colunas: {df.columns.tolist()}")
+function exportCSV(clients,seg){
+  const data=seg==="Todos"?clients:clients.filter(c=>c.segment===seg);
+  const hdr="customer_id,segment,recency,frequency,monetary,r_score,f_score,m_score";
+  const rows=data.map(c=>`${c.id},${c.segment},${c.rec},${c.freq},${c.mon.toFixed(2)},${c.rs},${c.fs},${c.ms}`);
+  const blob=new Blob([[hdr,...rows].join("\n")],{type:"text/csv"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`rfm_${seg}.csv`;a.click();
+}
 
-    # Renomear colunas para padronização
-    df = df.rename(columns={
-        'Invoice':     'invoice',
-        'StockCode':   'stock_code',
-        'Description': 'description',
-        'Quantity':    'quantity',
-        'InvoiceDate': 'invoice_date',
-        'Price':       'price',
-        'Customer ID': 'customer_id',
-        'Country':     'country'
-    })
+function ScatterCanvas({data,filter,hovId,setHov}){
+  const ref=useRef();
+  useEffect(()=>{
+    const cv=ref.current;if(!cv)return;
+    const ctx=cv.getContext("2d"),W=cv.width,H=cv.height,P=48;
+    ctx.clearRect(0,0,W,H);
+    const pts=filter==="Todos"?data:data.filter(c=>c.segment===filter);
+    if(!pts.length)return;
+    const xs=pts.map(c=>c.rec),ys=pts.map(c=>c.mon),zM=Math.max(...pts.map(c=>c.freq));
+    const xn=Math.min(...xs),xx=Math.max(...xs),yn=Math.min(...ys),yx=Math.max(...ys);
+    const tx=v=>P+(v-xn)/(xx-xn||1)*(W-P*2),ty=v=>H-P-(v-yn)/(yx-yn||1)*(H-P*1.7);
+    ctx.strokeStyle="rgba(99,102,241,0.06)";ctx.lineWidth=1;
+    for(let i=0;i<=5;i++){
+      ctx.beginPath();ctx.moveTo(P+i*(W-P*2)/5,P*.4);ctx.lineTo(P+i*(W-P*2)/5,H-P);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(P,P*.4+i*(H-P*1.7)/5);ctx.lineTo(W-P,P*.4+i*(H-P*1.7)/5);ctx.stroke();
+    }
+    ctx.fillStyle="rgba(100,116,139,0.4)";ctx.font="11px system-ui";ctx.textAlign="center";
+    ctx.fillText("← mais recente   Recência (dias)   mais antigo →",W/2,H-8);
+    ctx.save();ctx.translate(15,H/2);ctx.rotate(-Math.PI/2);ctx.fillText("Valor total",0,0);ctx.restore();
+    pts.forEach(c=>{
+      const x=tx(c.rec),y=ty(c.mon),r=3+c.freq/zM*12,hov=c.id===hovId;
+      ctx.beginPath();ctx.arc(x,y,hov?r+4:r,0,Math.PI*2);
+      if(hov){ctx.shadowBlur=16;ctx.shadowColor=SEGS[c.segment].hex;}
+      ctx.fillStyle=SEGS[c.segment].hex+(hov?"ff":"90");ctx.fill();ctx.shadowBlur=0;
+      if(hov){ctx.strokeStyle="#fff";ctx.lineWidth=2.5;ctx.stroke();}
+    });
+  },[data,filter,hovId]);
 
-    # Limpeza
-    df = df.dropna(subset=["customer_id"])
-    df = df[df["quantity"] > 0]
-    df = df[df["price"] > 0]
-    df = df[~df["invoice"].astype(str).str.startswith("C")]
-    df["total_value"] = df["quantity"] * df["price"]
-    df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    df["customer_id"] = df["customer_id"].astype(int)
+  const onMove=e=>{
+    const cv=ref.current;if(!cv)return;
+    const rect=cv.getBoundingClientRect(),mx=(e.clientX-rect.left)*(cv.width/rect.width),my=(e.clientY-rect.top)*(cv.height/rect.height);
+    const pts=filter==="Todos"?data:data.filter(c=>c.segment===filter);
+    const P=48,W=cv.width,H=cv.height;
+    const xs=pts.map(c=>c.rec),ys=pts.map(c=>c.mon);
+    const xn=Math.min(...xs),xx=Math.max(...xs),yn=Math.min(...ys),yx=Math.max(...ys);
+    const tx=v=>P+(v-xn)/(xx-xn||1)*(W-P*2),ty=v=>H-P-(v-yn)/(yx-yn||1)*(H-P*1.7);
+    let found=null,best=Infinity;
+    pts.forEach(c=>{const dx=tx(c.rec)-mx,dy=ty(c.mon)-my,d=dx*dx+dy*dy;if(d<best&&d<600){best=d;found=c;}});
+    setHov(found||null);
+  };
+  return <canvas ref={ref} width={700} height={300} style={{width:"100%",height:"auto",cursor:"crosshair",display:"block"}} onMouseMove={onMove} onMouseLeave={()=>setHov(null)}/>;
+}
 
-    print(f"   Shape após limpeza: {df.shape}")
-    print(f"   Clientes únicos: {df['customer_id'].nunique():,}")
-    print(f"   Período: {df['invoice_date'].min().date()} → {df['invoice_date'].max().date()}")
-    print(f"   Receita total: £{df['total_value'].sum():,.2f}")
-    return df
+function MiniBar({value,max,color}){
+  return(
+    <div style={{flex:1,height:6,borderRadius:3,background:"#f1f5f9",overflow:"hidden"}}>
+      <div style={{width:`${Math.min((value/max)*100,100)}%`,height:"100%",background:color,borderRadius:3,transition:"width .3s"}}/>
+    </div>
+  );
+}
 
-# ── 4. Cálculo RFM ───────────────────────────────────────────────
+function ChurnRing({value}){
+  const r=20,circ=2*Math.PI*r,pct=Math.min(parseFloat(value)||0,1);
+  const col=pct>.6?"#ef4444":pct>.35?"#f59e0b":"#10b981";
+  return(
+    <svg width={56} height={56} viewBox="0 0 56 56">
+      <circle cx={28} cy={28} r={r} fill="none" stroke="#f1f5f9" strokeWidth={5}/>
+      <circle cx={28} cy={28} r={r} fill="none" stroke={col} strokeWidth={5}
+        strokeDasharray={circ} strokeDashoffset={circ*(1-pct)}
+        strokeLinecap="round" transform="rotate(-90 28 28)"/>
+      <text x={28} y={33} textAnchor="middle" fontSize={11} fontWeight={600} fill={col}>{Math.round(pct*100)}%</text>
+    </svg>
+  );
+}
 
-def compute_rfm(df):
-    """Calcula Recência, Frequência e Monetário por cliente."""
-    print("\n📊 Calculando scores RFM...")
-    ref_date = df["invoice_date"].max() + pd.Timedelta(days=1)
-    rfm = df.groupby("customer_id").agg(
-        recency   = ("invoice_date", lambda x: (ref_date - x.max()).days),
-        frequency = ("invoice",       "nunique"),
-        monetary  = ("total_value",   "sum")
-    ).reset_index()
-    print(f"\n   Estatísticas RFM:")
-    print(rfm[["recency","frequency","monetary"]].describe().round(2).to_string())
-    return rfm
+function ScoreBar({v}){
+  return(
+    <div style={{display:"flex",gap:2}}>
+      {[1,2,3,4,5].map(i=><div key={i} style={{width:12,height:4,borderRadius:2,background:i<=v?(v>=4?"#10b981":v>=3?"#f59e0b":"#ef4444"):"#e2e8f0"}}/>)}
+    </div>
+  );
+}
 
-# ── 5. Normalização ───────────────────────────────────────────────
+export default function App(){
+  const [clients,setClients]=useState([]);
+  const [filter,setFilter]=useState("Todos");
+  const [page,setPage]=useState("overview");
+  const [hov,setHov]=useState(null);
+  const [sort,setSort]=useState({col:"mon",asc:false});
+  const [tpage,setTpage]=useState(0);
+  const [sideOpen,setSideOpen]=useState(true);
+  const [loading,setLoading]=useState(true);
+  const PAGE=12;
 
-def normalize_rfm(rfm):
-    """Normaliza com Log1p + MinMaxScaler."""
-    print("\n⚙️  Normalizando dados RFM...")
-    rfm_norm = rfm.copy()
-    rfm_norm["monetary"]  = np.log1p(rfm_norm["monetary"])
-    rfm_norm["frequency"] = np.log1p(rfm_norm["frequency"])
-    scaler = MinMaxScaler()
-    features = ["recency", "frequency", "monetary"]
-    rfm_norm[features] = scaler.fit_transform(rfm_norm[features])
-    rfm_norm["recency"] = 1 - rfm_norm["recency"]
-    X = rfm_norm[features].values
-    print(f"   Shape: {X.shape} | Min: {X.min():.3f} | Max: {X.max():.3f}")
-    return X, scaler, rfm_norm
+  useEffect(()=>{
+    setLoading(true);
+    setTimeout(()=>{setClients(buildClients(genRows(180)));setLoading(false);},800);
+  },[]);
 
-# ── 6. Autoencoder ────────────────────────────────────────────────
+  const handleFile=e=>{
+    const f=e.target.files[0];if(!f)return;
+    setLoading(true);
+    const r=new FileReader();
+    r.onload=ev=>{
+      try{setClients(buildClients(parseCSV(ev.target.result)));setTpage(0);}
+      catch{alert("Erro ao processar CSV.");}
+      setLoading(false);
+    };
+    r.readAsText(f);
+  };
 
-def build_autoencoder(input_dim=3, latent_dim=2):
-    """
-    Autoencoder profundo com arquitetura simétrica.
-    Encoder: input_dim → 64 → 32 → latent_dim
-    Decoder: latent_dim → 32 → 64 → input_dim
-    Referência: Hinton & Salakhutdinov (2006)
-    """
-    # Encoder
-    enc_in  = layers.Input(shape=(input_dim,), name="encoder_input")
-    x       = layers.Dense(64, activation="relu")(enc_in)
-    x       = layers.BatchNormalization()(x)
-    x       = layers.Dropout(0.2)(x)
-    x       = layers.Dense(32, activation="relu")(x)
-    x       = layers.BatchNormalization()(x)
-    latent  = layers.Dense(latent_dim, activation="linear", name="latent")(x)
-    encoder = Model(enc_in, latent, name="encoder")
+  const counts=Object.fromEntries(SK.map(s=>[s,clients.filter(c=>c.segment===s).length]));
+  const revs=Object.fromEntries(SK.map(s=>[s,clients.filter(c=>c.segment===s).reduce((a,c)=>a+c.mon,0)]));
+  const totalRev=clients.reduce((a,c)=>a+c.mon,0);
+  const fil=filter==="Todos"?clients:clients.filter(c=>c.segment===filter);
+  const srtd=[...fil].sort((a,b)=>sort.asc?a[sort.col]-b[sort.col]:b[sort.col]-a[sort.col]);
+  const tPages=Math.ceil(srtd.length/PAGE),pageD=srtd.slice(tpage*PAGE,(tpage+1)*PAGE);
+  const top5=[...clients].sort((a,b)=>b.mon-a.mon).slice(0,5);
 
-    # Decoder
-    dec_in  = layers.Input(shape=(latent_dim,), name="decoder_input")
-    x       = layers.Dense(32, activation="relu")(dec_in)
-    x       = layers.BatchNormalization()(x)
-    x       = layers.Dense(64, activation="relu")(x)
-    x       = layers.BatchNormalization()(x)
-    dec_out = layers.Dense(input_dim, activation="sigmoid", name="decoder_output")(x)
-    decoder = Model(dec_in, dec_out, name="decoder")
+  const navItems=[
+    {id:"overview",icon:"◉",label:"Visão Geral"},
+    {id:"scatter",icon:"⬡",label:"Dispersão RFM"},
+    {id:"clients",icon:"≡",label:"Clientes"},
+    {id:"top",icon:"★",label:"Top Clientes"},
+  ];
 
-    # Autoencoder completo
-    ae_in  = layers.Input(shape=(input_dim,), name="ae_input")
-    ae_out = decoder(encoder(ae_in))
-    autoencoder = Model(ae_in, ae_out, name="autoencoder")
-    autoencoder.compile(optimizer=Adam(1e-3), loss="mse", metrics=["mae"])
+  const badge=s=>({display:"inline-flex",alignItems:"center",gap:5,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:SEGS[s].bg,color:SEGS[s].tx});
+  const card={background:"#fff",borderRadius:14,border:"1px solid #e2e8f0",padding:"20px 22px"};
 
-    print("\n🧠 Arquitetura do Autoencoder:")
-    autoencoder.summary()
-    return autoencoder, encoder, decoder
+  if(loading) return(
+    <div style={{display:"flex",height:"100vh",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16,fontFamily:"system-ui,sans-serif",background:"#f8fafc"}}>
+      <div style={{width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:24}}>📊</div>
+      <div style={{fontSize:16,fontWeight:600,color:"#1e1b4b"}}>Carregando RFM Pro...</div>
+      <div style={{width:200,height:4,borderRadius:2,background:"#e2e8f0",overflow:"hidden"}}>
+        <div style={{width:"70%",height:"100%",background:"linear-gradient(90deg,#6366f1,#8b5cf6)",borderRadius:2}}/>
+      </div>
+    </div>
+  );
 
-# ── 7. Treinamento ────────────────────────────────────────────────
+  return(
+    <div style={{display:"flex",height:"100vh",fontFamily:"system-ui,sans-serif",background:"#f8fafc",color:"#0f172a",fontSize:14}}>
 
-def train_autoencoder(autoencoder, X, epochs=150, batch_size=64):
-    """Treina com Early Stopping e ReduceLROnPlateau."""
-    print("\n🏋️  Treinando Autoencoder...")
-    cbs = [
-        callbacks.EarlyStopping(monitor="val_loss", patience=15,
-                                restore_best_weights=True, verbose=1),
-        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                    patience=7, min_lr=1e-6, verbose=1),
-    ]
-    history = autoencoder.fit(
-        X, X, epochs=epochs, batch_size=batch_size,
-        validation_split=0.15, callbacks=cbs, verbose=1
-    )
-    print(f"\n✅ Treinamento concluído!")
-    print(f"   Melhor val_loss: {min(history.history['val_loss']):.6f}")
-    return history
+      {/* ── Sidebar ── */}
+      <div style={{width:sideOpen?220:64,flexShrink:0,background:"#1e1b4b",display:"flex",flexDirection:"column",transition:"width .25s",overflow:"hidden"}}>
+        <div style={{padding:"20px 16px",display:"flex",alignItems:"center",gap:10,borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+          <div style={{width:34,height:34,borderRadius:10,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>📊</div>
+          {sideOpen&&<div>
+            <div style={{fontSize:15,fontWeight:700,color:"#fff"}}>RFM<span style={{color:"#a5b4fc"}}>Pro</span></div>
+            <div style={{fontSize:10,color:"rgba(255,255,255,0.4)"}}>Analytics Platform</div>
+          </div>}
+        </div>
+        <div style={{flex:1,padding:"12px 0"}}>
+          {sideOpen&&<div style={{padding:"6px 24px 10px",fontSize:10,fontWeight:700,color:"rgba(255,255,255,0.3)",letterSpacing:1,textTransform:"uppercase"}}>Menu</div>}
+          {navItems.map(item=>{
+            const act=page===item.id;
+            return(
+              <div key={item.id} onClick={()=>setPage(item.id)} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 16px",cursor:"pointer",borderRadius:8,margin:"2px 8px",background:act?"rgba(99,102,241,0.2)":"transparent",color:act?"#a5b4fc":"rgba(255,255,255,0.6)",transition:"all .15s",whiteSpace:"nowrap"}}>
+                <span style={{fontSize:16,flexShrink:0}}>{item.icon}</span>
+                {sideOpen&&<span style={{fontSize:13,fontWeight:500}}>{item.label}</span>}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{padding:12,borderTop:"1px solid rgba(255,255,255,0.08)"}}>
+          <div onClick={()=>setSideOpen(!sideOpen)} style={{display:"flex",alignItems:"center",justifyContent:"center",padding:"10px 16px",cursor:"pointer",borderRadius:8,color:"rgba(255,255,255,0.6)"}}>
+            <span style={{fontSize:14}}>{sideOpen?"◀":"▶"}</span>
+          </div>
+        </div>
+      </div>
 
-# ── 8. Visualizações ──────────────────────────────────────────────
+      {/* ── Main ── */}
+      <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
 
-def plot_training_history(history):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle("Histórico de Treinamento — Autoencoder", fontsize=13, fontweight="bold")
-    axes[0].plot(history.history["loss"],     label="Train", color="#7F77DD", lw=2)
-    axes[0].plot(history.history["val_loss"], label="Val",   color="#E24B4A", lw=2)
-    axes[0].set_title("Loss (MSE)"); axes[0].set_xlabel("Época")
-    axes[0].legend(); axes[0].grid(alpha=0.3)
-    axes[1].plot(history.history["mae"],     label="Train MAE", color="#1D9E75", lw=2)
-    axes[1].plot(history.history["val_mae"], label="Val MAE",   color="#EF9F27", lw=2)
-    axes[1].set_title("MAE"); axes[1].set_xlabel("Época")
-    axes[1].legend(); axes[1].grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("training_history.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("   💾 Salvo: training_history.png")
+        {/* Header */}
+        <div style={{background:"#fff",borderBottom:"1px solid #e2e8f0",padding:"0 24px",height:60,display:"flex",alignItems:"center",gap:12,flexShrink:0,flexWrap:"wrap"}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:16,fontWeight:700}}>{navItems.find(n=>n.id===page)?.label}</div>
+            <div style={{fontSize:12,color:"#94a3b8"}}>{clients.length} clientes · {new Date().toLocaleDateString("pt-BR",{day:"2-digit",month:"long",year:"numeric"})}</div>
+          </div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {["Todos",...SK].map(sg=>{
+              const act=filter===sg,col=SEGS[sg]?.hex;
+              return(
+                <button key={sg} onClick={()=>{setFilter(sg);setTpage(0);}} style={{padding:"5px 12px",borderRadius:20,border:act?`1.5px solid ${col||"#6366f1"}`:"1px solid #e2e8f0",background:act?(SEGS[sg]?.bg||"#eff6ff"):"#fff",color:act?(SEGS[sg]?.tx||"#1e3a8a"):"#64748b",fontSize:11,fontWeight:act?600:400,cursor:"pointer"}}>
+                  {SEGS[sg]?.emoji} {sg}{SEGS[sg]?` (${counts[sg]||0})`:""}
+                </button>
+              );
+            })}
+          </div>
+          <label style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:500,cursor:"pointer",border:"1px solid #e2e8f0",background:"#f8fafc",color:"#475569"}}>
+            ↑ CSV<input type="file" accept=".csv" onChange={handleFile} style={{display:"none"}}/>
+          </label>
+          <button onClick={()=>exportCSV(clients,filter)} style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:500,cursor:"pointer",border:"none",background:"#6366f1",color:"#fff"}}>↓ Exportar</button>
+        </div>
 
-def elbow_method(X_latent, k_range=range(2, 11)):
-    print("\n📐 Calculando Elbow Method...")
-    results = []
-    for k in k_range:
-        km = KMeans(n_clusters=k, random_state=SEED, n_init=10)
-        labels = km.fit_predict(X_latent)
-        sil = silhouette_score(X_latent, labels)
-        dbi = davies_bouldin_score(X_latent, labels)
-        results.append({"k":k,"inertia":km.inertia_,"silhouette":sil,"davies_bouldin":dbi})
-        print(f"   K={k:2d} | Inertia={km.inertia_:10.1f} | Silhouette={sil:.4f} | DBI={dbi:.4f}")
-    df_k = pd.DataFrame(results)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("Elbow Method — Determinação do K Ideal", fontsize=13, fontweight="bold")
-    axes[0].plot(df_k["k"], df_k["inertia"],       "bo-", lw=2); axes[0].set_title("Inertia")
-    axes[1].plot(df_k["k"], df_k["silhouette"],    "go-", lw=2); axes[1].set_title("Silhouette ↑")
-    axes[2].plot(df_k["k"], df_k["davies_bouldin"],"ro-", lw=2); axes[2].set_title("Davies-Bouldin ↓")
-    for ax in axes: ax.set_xlabel("K"); ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("elbow_method.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("   💾 Salvo: elbow_method.png")
-    return df_k
+        {/* Content */}
+        <div style={{flex:1,overflowY:"auto",padding:24}}>
 
-def plot_latent_space(X_latent, labels, k):
-    colors = ["#7F77DD","#1D9E75","#EF9F27","#E24B4A","#378ADD"]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("Espaço Latente do Autoencoder", fontsize=13, fontweight="bold")
-    for i in range(k):
-        mask = labels == i
-        axes[0].scatter(X_latent[mask,0], X_latent[mask,1],
-                       c=colors[i%len(colors)], label=f"Cluster {i}", alpha=0.6, s=15)
-    axes[0].set_title("Espaço Latente 2D"); axes[0].legend(); axes[0].grid(alpha=0.2)
-    print("\n🗺️  Gerando t-SNE...")
-    X_tsne = TSNE(n_components=2, random_state=SEED, perplexity=30).fit_transform(X_latent)
-    for i in range(k):
-        mask = labels == i
-        axes[1].scatter(X_tsne[mask,0], X_tsne[mask,1],
-                       c=colors[i%len(colors)], label=f"Cluster {i}", alpha=0.6, s=15)
-    axes[1].set_title("t-SNE"); axes[1].legend(); axes[1].grid(alpha=0.2)
-    plt.tight_layout()
-    plt.savefig("latent_space.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("   💾 Salvo: latent_space.png")
+          {/* ── Overview ── */}
+          {page==="overview"&&<div style={{display:"flex",flexDirection:"column",gap:20}}>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:14}}>
+              {[
+                {label:"Total Clientes",value:fN(clients.length),sub:"base ativa",color:"#6366f1",icon:"👥"},
+                {label:"Receita Total",value:fK(totalRev),sub:"período analisado",color:"#10b981",icon:"💰"},
+                {label:"Ticket Médio",value:fK(clients.length?totalRev/clients.length:0),sub:"por cliente",color:"#3b82f6",icon:"🎫"},
+                {label:"Clientes VIP",value:fN(counts.VIP||0),sub:`${clients.length?(((counts.VIP||0)/clients.length)*100).toFixed(1):0}% da base`,color:"#8b5cf6",icon:"👑"},
+                {label:"Em Risco",value:fN(counts["Em Risco"]||0),sub:"precisam atenção",color:"#f59e0b",icon:"⚠️"},
+              ].map(k=>(
+                <div key={k.label} style={{background:"#fff",borderRadius:14,border:"1px solid #e2e8f0",padding:"18px 20px",borderLeft:`4px solid ${k.color}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:.5}}>{k.label}</div>
+                    <div style={{fontSize:18}}>{k.icon}</div>
+                  </div>
+                  <div style={{fontSize:26,fontWeight:700,color:k.color,marginBottom:2}}>{k.value}</div>
+                  <div style={{fontSize:11,color:"#94a3b8"}}>{k.sub}</div>
+                </div>
+              ))}
+            </div>
 
-def plot_cluster_profiles(rfm, k):
-    colors = ["#7F77DD","#1D9E75","#EF9F27","#E24B4A","#378ADD"]
-    profile = rfm.groupby("cluster").agg(
-        n_clientes = ("customer_id","count"),
-        recencia   = ("recency",    "mean"),
-        frequencia = ("frequency",  "mean"),
-        monetario  = ("monetary",   "mean")
-    ).round(2)
-    print("\n📋 Perfil médio por cluster:")
-    print(profile.to_string())
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle("Perfil Médio dos Clusters — RFM", fontsize=13, fontweight="bold")
-    for ax, col, title in zip(axes,
-        ["recencia","frequencia","monetario"],
-        ["Recência (dias)","Frequência (compras)","Monetário (£)"]):
-        bars = ax.bar(profile.index.astype(str), profile[col],
-                     color=[colors[i%len(colors)] for i in profile.index])
-        ax.set_title(title); ax.bar_label(bars, fmt="%.1f", padding=3)
-        ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("cluster_profiles.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("   💾 Salvo: cluster_profiles.png")
-    return profile
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12}}>
+              {SK.map(sg=>{
+                const cnt=counts[sg]||0,rev=revs[sg]||0,pct=clients.length?cnt/clients.length*100:0;
+                const act=filter===sg;
+                return(
+                  <div key={sg} onClick={()=>setFilter(act?"Todos":sg)} style={{background:act?SEGS[sg].bg:"#fff",borderRadius:12,border:`${act?"1.5px":"1px"} solid ${act?SEGS[sg].hex+"66":"#e2e8f0"}`,padding:"14px 16px",cursor:"pointer",transition:"all .15s"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                      <span style={{fontSize:20}}>{SEGS[sg].emoji}</span>
+                      <span style={{fontSize:11,fontWeight:700,color:SEGS[sg].hex}}>{pct.toFixed(1)}%</span>
+                    </div>
+                    <div style={{fontSize:13,fontWeight:700,color:SEGS[sg].tx,marginBottom:2}}>{sg}</div>
+                    <div style={{fontSize:11,color:"#94a3b8",marginBottom:10}}>{SEGS[sg].desc}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                      <MiniBar value={cnt} max={clients.length||1} color={SEGS[sg].hex}/>
+                      <span style={{fontSize:11,fontWeight:600,color:"#475569",minWidth:24}}>{cnt}</span>
+                    </div>
+                    <div style={{fontSize:11,color:"#64748b"}}>Receita: <strong style={{color:SEGS[sg].hex}}>{fK(rev)}</strong></div>
+                  </div>
+                );
+              })}
+            </div>
 
-def compare_methods(X, X_latent, k, sil_ae, dbi_ae):
-    print("\n⚖️  Comparando métodos...")
-    km_raw  = KMeans(n_clusters=k, random_state=SEED, n_init=20).fit(X)
-    sil_raw = silhouette_score(X, km_raw.labels_)
-    dbi_raw = davies_bouldin_score(X, km_raw.labels_)
-    df_comp = pd.DataFrame({
-        "KMeans (RFM bruto)":   {"Silhouette ↑": sil_raw, "Davies-Bouldin ↓": dbi_raw},
-        "KMeans + Autoencoder": {"Silhouette ↑": sil_ae,  "Davies-Bouldin ↓": dbi_ae},
-    }).T.round(4)
-    print("\n📊 Tabela de Comparação:")
-    print(df_comp.to_string())
-    df_comp.to_csv("comparacao_metodos.csv")
-    print("   💾 Salvo: comparacao_metodos.csv")
-    return df_comp
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+              <div style={card}>
+                <div style={{fontSize:13,fontWeight:700,marginBottom:16,display:"flex",justifyContent:"space-between"}}>
+                  <span>Top 5 Clientes</span><span style={{fontSize:11,color:"#94a3b8"}}>por receita</span>
+                </div>
+                {top5.map((c,i)=>(
+                  <div key={c.id} style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0",borderBottom:i<4?"1px solid #f8fafc":"none"}}>
+                    <div style={{width:26,height:26,borderRadius:8,background:i===0?"#fef3c7":i===1?"#f1f5f9":"#f8fafc",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:i===0?"#d97706":"#64748b",flexShrink:0}}>{i+1}</div>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:12,fontWeight:600,fontFamily:"monospace"}}>{c.id}</div>
+                      <span style={badge(c.segment)}>{SEGS[c.segment].emoji} {c.segment}</span>
+                    </div>
+                    <div style={{fontSize:13,fontWeight:700,color:"#10b981"}}>{fK(c.mon)}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={card}>
+                <div style={{fontSize:13,fontWeight:700,marginBottom:16}}>Risco de Churn por Segmento</div>
+                {SK.map(sg=>{
+                  const churnVal=CHURN_MAP[SEGS[sg].hex]||0.3;
+                  return(
+                    <div key={sg} style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+                      <div style={{fontSize:13,minWidth:80,color:SEGS[sg].tx,fontWeight:500}}>{SEGS[sg].emoji} {sg}</div>
+                      <MiniBar value={churnVal} max={1} color={SEGS[sg].hex}/>
+                      <div style={{fontSize:12,fontWeight:600,color:SEGS[sg].hex,minWidth:36}}>{(churnVal*100).toFixed(0)}%</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>}
 
-# ── 9. Pipeline principal ─────────────────────────────────────────
+          {/* ── Scatter ── */}
+          {page==="scatter"&&<div style={{display:"flex",flexDirection:"column",gap:16}}>
+            <div style={card}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
+                <div>
+                  <div style={{fontSize:13,fontWeight:700}}>Dispersão RFM</div>
+                  <div style={{fontSize:11,color:"#94a3b8"}}>X = Recência · Y = Monetário · Tamanho = Frequência</div>
+                </div>
+                <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                  {SK.map(sg=><span key={sg} style={{fontSize:11,display:"flex",alignItems:"center",gap:4,color:"#64748b"}}><span style={{width:8,height:8,borderRadius:2,background:SEGS[sg].hex,display:"inline-block"}}/>{sg}</span>)}
+                </div>
+              </div>
+              <ScatterCanvas data={clients} filter={filter} hovId={hov?.id} setHov={setHov}/>
+            </div>
+            {hov&&(
+              <div style={{...card,borderLeft:`4px solid ${SEGS[hov.segment].hex}`,display:"flex",gap:20,alignItems:"center",flexWrap:"wrap"}}>
+                <ChurnRing value={hov.churn}/>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+                    <span style={{fontSize:15,fontWeight:700,fontFamily:"monospace"}}>{hov.id}</span>
+                    <span style={badge(hov.segment)}>{SEGS[hov.segment].emoji} {hov.segment}</span>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12}}>
+                    {[["Recência",`${hov.rec} dias`],["Frequência",`${hov.freq} compras`],["Monetário",fR(hov.mon)]].map(([l,v])=>(
+                      <div key={l} style={{background:"#f8fafc",borderRadius:8,padding:"8px 10px"}}>
+                        <div style={{fontSize:10,color:"#94a3b8",marginBottom:2}}>{l}</div>
+                        <div style={{fontSize:13,fontWeight:700}}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {[["R",hov.rs],["F",hov.fs],["M",hov.ms]].map(([l,v])=>(
+                    <div key={l} style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontSize:11,color:"#94a3b8",width:14}}>{l}</span>
+                      <ScoreBar v={v}/>
+                      <span style={{fontSize:11,fontWeight:700,color:"#475569"}}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>}
 
-def main():
-    print("=" * 60)
-    print(" TCC — Segmentação RFM com Autoencoder + KMeans")
-    print(" Pós-Graduação em Deep Learning — UFPE")
-    print("=" * 60)
+          {/* ── Clients ── */}
+          {page==="clients"&&<div style={card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:700}}>Base de Clientes</div>
+                <div style={{fontSize:11,color:"#94a3b8"}}>{fil.length} clientes · clique no cabeçalho para ordenar</div>
+              </div>
+              <button onClick={()=>exportCSV(clients,filter)} style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:500,cursor:"pointer",border:"1px solid #e2e8f0",background:"#f8fafc",color:"#475569"}}>↓ Exportar seleção</button>
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse"}}>
+                <thead>
+                  <tr style={{borderBottom:"2px solid #f1f5f9"}}>
+                    {[["id","Cliente"],["segment","Segmento"],["rec","Recência"],["freq","Compras"],["mon","Valor"],["churn","Churn"],["rs","R"],["fs","F"],["ms","M"]].map(([col,lb])=>(
+                      <th key={col} onClick={()=>{if(col==="segment"||col==="churn")return;setSort(st=>({col,asc:st.col===col?!st.asc:false}));setTpage(0);}} style={{padding:"10px 12px",textAlign:"left",fontSize:11,fontWeight:600,color:"#64748b",cursor:col!=="segment"&&col!=="churn"?"pointer":"default",whiteSpace:"nowrap",userSelect:"none",background:sort.col===col?"#f8fafc":"transparent"}}>
+                        {lb}{sort.col===col?(sort.asc?" ↑":" ↓"):""}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageD.map((c,i)=>(
+                    <tr key={c.id} style={{background:i%2?"#fafafa":"#fff",borderBottom:"1px solid #f1f5f9"}}>
+                      <td style={{padding:"9px 12px",fontFamily:"monospace",fontSize:11,color:"#64748b"}}>{c.id}</td>
+                      <td style={{padding:"9px 12px"}}><span style={badge(c.segment)}>{SEGS[c.segment].emoji} {c.segment}</span></td>
+                      <td style={{padding:"9px 12px"}}>{c.rec}d</td>
+                      <td style={{padding:"9px 12px"}}>{c.freq}x</td>
+                      <td style={{padding:"9px 12px",fontWeight:600}}>{fR(c.mon)}</td>
+                      <td style={{padding:"9px 12px"}}><span style={{fontSize:12,fontWeight:700,color:parseFloat(c.churn)>.5?"#ef4444":parseFloat(c.churn)>.3?"#f59e0b":"#10b981"}}>{(parseFloat(c.churn)*100).toFixed(0)}%</span></td>
+                      <td style={{padding:"9px 12px"}}><ScoreBar v={c.rs}/></td>
+                      <td style={{padding:"9px 12px"}}><ScoreBar v={c.fs}/></td>
+                      <td style={{padding:"9px 12px"}}><ScoreBar v={c.ms}/></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:16,fontSize:12,color:"#64748b"}}>
+              <span>Página {tpage+1} de {tPages||1} · {fil.length} registros</span>
+              <div style={{display:"flex",gap:8}}>
+                {["← Anterior","Próxima →"].map((lb,di)=>{
+                  const dis=di===0?tpage===0:tpage>=tPages-1;
+                  return <button key={lb} onClick={()=>setTpage(p=>di===0?Math.max(0,p-1):Math.min(tPages-1,p+1))} disabled={dis} style={{padding:"6px 12px",border:"1px solid #e2e8f0",borderRadius:8,background:"transparent",cursor:dis?"not-allowed":"pointer",opacity:dis?.4:1,fontSize:12}}>{lb}</button>;
+                })}
+              </div>
+            </div>
+          </div>}
 
-    # Upload do arquivo (Google Colab)
-    try:
-        from google.colab import files
-        print("\n📂 Faça o upload do arquivo online_retail_II.xlsx")
-        uploaded = files.upload()
-        PATH = "online_retail_II.xlsx"
-    except ImportError:
-        # Execução local
-        PATH = "online_retail_II.xlsx"
-        print(f"\n📂 Usando arquivo local: {PATH}")
+          {/* ── Top ── */}
+          {page==="top"&&<div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:12}}>
+              {[...clients].sort((a,b)=>b.mon-a.mon).slice(0,3).map((c,i)=>(
+                <div key={c.id} style={{...card,borderTop:`4px solid ${i===0?"#f59e0b":i===1?"#94a3b8":"#cd7c3f"}`,textAlign:"center"}}>
+                  <div style={{fontSize:28,marginBottom:8}}>{i===0?"🥇":i===1?"🥈":"🥉"}</div>
+                  <div style={{fontSize:16,fontWeight:700,fontFamily:"monospace",marginBottom:6}}>{c.id}</div>
+                  <span style={badge(c.segment)}>{SEGS[c.segment].emoji} {c.segment}</span>
+                  <div style={{fontSize:22,fontWeight:700,color:"#10b981",margin:"12px 0 4px"}}>{fR(c.mon)}</div>
+                  <div style={{fontSize:11,color:"#94a3b8"}}>{c.freq} compras · {c.rec} dias</div>
+                </div>
+              ))}
+            </div>
+            <div style={card}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:16}}>Top 10 Clientes por Receita</div>
+              <table style={{width:"100%",borderCollapse:"collapse"}}>
+                <thead>
+                  <tr style={{borderBottom:"2px solid #f1f5f9"}}>
+                    {["#","Cliente","Segmento","Recência","Compras","Receita","Churn"].map(h=>(
+                      <th key={h} style={{padding:"10px 14px",textAlign:"left",fontSize:11,fontWeight:600,color:"#64748b",whiteSpace:"nowrap"}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...clients].sort((a,b)=>b.mon-a.mon).slice(0,10).map((c,i)=>(
+                    <tr key={c.id} style={{background:i%2?"#fafafa":"#fff",borderBottom:"1px solid #f1f5f9"}}>
+                      <td style={{padding:"10px 14px",fontWeight:700,color:i<3?"#d97706":"#94a3b8"}}>{i+1}</td>
+                      <td style={{padding:"10px 14px",fontFamily:"monospace",fontSize:12}}>{c.id}</td>
+                      <td style={{padding:"10px 14px"}}><span style={badge(c.segment)}>{SEGS[c.segment].emoji} {c.segment}</span></td>
+                      <td style={{padding:"10px 14px"}}>{c.rec}d</td>
+                      <td style={{padding:"10px 14px"}}>{c.freq}x</td>
+                      <td style={{padding:"10px 14px",fontWeight:700,color:"#10b981"}}>{fR(c.mon)}</td>
+                      <td style={{padding:"10px 14px"}}><ChurnRing value={c.churn}/></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>}
 
-    # Pipeline
-    df  = load_and_preprocess(PATH)
-    rfm = compute_rfm(df)
-    X, scaler, rfm_norm = normalize_rfm(rfm)
-
-    autoencoder, encoder, decoder = build_autoencoder(input_dim=3, latent_dim=2)
-    history = train_autoencoder(autoencoder, X, epochs=150, batch_size=64)
-    plot_training_history(history)
-
-    X_latent = encoder.predict(X, verbose=0)
-    print(f"\n✅ Espaço latente gerado: {X_latent.shape}")
-
-    df_elbow = elbow_method(X_latent, k_range=range(2, 11))
-
-    K_IDEAL = 5
-    km_final = KMeans(n_clusters=K_IDEAL, random_state=SEED, n_init=20)
-    rfm["cluster"] = km_final.fit_predict(X_latent)
-    sil = silhouette_score(X_latent, rfm["cluster"])
-    dbi = davies_bouldin_score(X_latent, rfm["cluster"])
-    print(f"\n✅ K={K_IDEAL} | Silhouette: {sil:.4f} | Davies-Bouldin: {dbi:.4f}")
-
-    plot_latent_space(X_latent, rfm["cluster"].values, K_IDEAL)
-    profile = plot_cluster_profiles(rfm, K_IDEAL)
-    df_comp = compare_methods(X, X_latent, K_IDEAL, sil, dbi)
-
-    # Exportar resultados
-    rfm["latent_1"] = X_latent[:, 0]
-    rfm["latent_2"] = X_latent[:, 1]
-    rfm.to_csv("rfm_clusters_final.csv", index=False)
-
-    print("\n" + "=" * 60)
-    print(" ✅ PIPELINE CONCLUÍDO!")
-    print("=" * 60)
-    print(f" Clientes segmentados:  {len(rfm):,}")
-    print(f" Clusters (K):          {K_IDEAL}")
-    print(f" Silhouette Score:      {sil:.4f}")
-    print(f" Davies-Bouldin Index:  {dbi:.4f}")
-    print("=" * 60)
-    print("\n📁 Arquivos gerados:")
-    print("   📊 training_history.png")
-    print("   📐 elbow_method.png")
-    print("   🗺️  latent_space.png")
-    print("   📋 cluster_profiles.png")
-    print("   ⚖️  comparacao_metodos.csv")
-    print("   💾 rfm_clusters_final.csv  ← importar no dashboard!")
-
-
-if __name__ == "__main__":
-    main()
+        </div>
+      </div>
+    </div>
+  );
+}
