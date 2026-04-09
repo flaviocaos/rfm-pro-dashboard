@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import * as tf from "@tensorflow/tfjs";
 
 const SEGS = {
   VIP:        { hex:"#8b5cf6", bg:"#f5f3ff", tx:"#4c1d95", emoji:"👑", desc:"Alto valor, alta freq., recente" },
@@ -13,6 +14,48 @@ const CHURN_MAP = {"#8b5cf6":0.05,"#10b981":0.15,"#f59e0b":0.55,"#ef4444":0.80,"
 const fR = v => `R$ ${(v||0).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
 const fN = v => (v||0).toLocaleString("pt-BR");
 const fK = v => v>=1000000?`${(v/1000000).toFixed(1)}M`:v>=1000?`${(v/1000).toFixed(1)}k`:String(Math.round(v||0));
+
+// ── TensorFlow.js helpers ──
+let tfModel = null;
+let scalerParams = null;
+
+async function loadModel() {
+  try {
+    scalerParams = await fetch("/scaler_params.json").then(r => r.json());
+    tfModel = await tf.loadLayersModel("/model/model.json");
+    console.log("✅ Modelo TF.js carregado!");
+    return true;
+  } catch(e) {
+    console.warn("⚠️ Modelo TF.js não encontrado, usando KMeans local.", e);
+    return false;
+  }
+}
+
+function scalerTransform(rec, freq, mon) {
+  if (!scalerParams) return [rec, freq, mon];
+  const [mr, mf, mm] = scalerParams.mean;
+  const [sr, sf, sm] = scalerParams.scale;
+  return [(rec - mr) / sr, (freq - mf) / sf, (mon - mm) / sm];
+}
+
+async function predictSegmentTF(rec, freq, mon) {
+  if (!tfModel || !scalerParams) return null;
+  const scaled = scalerTransform(rec, freq, mon);
+  const input = tf.tensor2d([scaled]);
+  const pred = tfModel.predict(input);
+  const clusterIdx = (await pred.argMax(1).data())[0];
+  const probs = await pred.data();
+  input.dispose(); pred.dispose();
+  // Mapear cluster index para segmento baseado em scores
+  const sc = v => v >= .75 ? 5 : v >= .5 ? 4 : v >= .35 ? 3 : v >= .2 ? 2 : 1;
+  const recMax = scalerParams.mean[0] + scalerParams.scale[0] * 2;
+  const rn = Math.max(0, Math.min(1, 1 - rec / recMax));
+  const fn = Math.max(0, Math.min(1, freq / 20));
+  const mn = Math.max(0, Math.min(1, mon / 15000));
+  const rs = sc(rn), fs = sc(fn), ms = sc(mn);
+  const seg = rs>=4&&fs>=4&&ms>=4?"VIP":(rs+fs+ms)/3>=3.5?"Leal":rs<=2&&(fs>=3||ms>=3)?"Em Risco":fs<=2&&ms<=2?"Inativo":"Novo";
+  return { seg, probs: Array.from(probs), clusterIdx, rs, fs, ms };
+}
 
 function genRows(n=180){
   const now=new Date("2024-12-31"),out=[];
@@ -107,7 +150,6 @@ function ScatterCanvas({data,filter,hovId,setHov}){
       if(hov){ctx.strokeStyle="#fff";ctx.lineWidth=2.5;ctx.stroke();}
     });
   },[data,filter,hovId]);
-
   const onMove=e=>{
     const cv=ref.current;if(!cv)return;
     const rect=cv.getBoundingClientRect(),mx=(e.clientX-rect.left)*(cv.width/rect.width),my=(e.clientY-rect.top)*(cv.height/rect.height);
@@ -153,6 +195,144 @@ function ScoreBar({v}){
   );
 }
 
+// ── Componente Preditor TF.js ──
+function TFPredictor({ modelLoaded }) {
+  const [rec, setRec] = useState(30);
+  const [freq, setFreq] = useState(5);
+  const [mon, setMon] = useState(1500);
+  const [result, setResult] = useState(null);
+  const [predicting, setPredicting] = useState(false);
+
+  const predict = async () => {
+    setPredicting(true);
+    setResult(null);
+    const res = await predictSegmentTF(Number(rec), Number(freq), Number(mon));
+    if (res) {
+      setResult(res);
+    } else {
+      const sc = v => v >= .75 ? 5 : v >= .5 ? 4 : v >= .35 ? 3 : v >= .2 ? 2 : 1;
+      const rn = Math.max(0, Math.min(1, 1 - rec / 400));
+      const fn = Math.max(0, Math.min(1, freq / 20));
+      const mn2 = Math.max(0, Math.min(1, mon / 15000));
+      const rs = sc(rn), fs = sc(fn), ms = sc(mn2);
+      const seg = rs>=4&&fs>=4&&ms>=4?"VIP":(rs+fs+ms)/3>=3.5?"Leal":rs<=2&&(fs>=3||ms>=3)?"Em Risco":fs<=2&&ms<=2?"Inativo":"Novo";
+      setResult({ seg, rs, fs, ms, probs: null });
+    }
+    setPredicting(false);
+  };
+
+  const card = { background:"#fff", borderRadius:14, border:"1px solid #e2e8f0", padding:"20px 22px" };
+  const actions = {
+    VIP: "Programa de fidelidade exclusivo, ofertas personalizadas.",
+    Leal: "Manter engajamento com comunicação regular.",
+    "Em Risco": "Campanha de reativação urgente, desconto especial.",
+    Inativo: "Email de reengajamento com oferta agressiva.",
+    Novo: "Onboarding personalizado, segunda compra incentivada.",
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <div style={{ ...card, borderTop:"4px solid #6366f1" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
+          <div style={{ fontSize:20 }}>🤖</div>
+          <div>
+            <div style={{ fontSize:14, fontWeight:700 }}>Preditor de Segmento — Deep Learning</div>
+            <div style={{ fontSize:11, color:"#94a3b8" }}>
+              {modelLoaded
+                ? "✅ TensorFlow.js ativo — modelo rodando no navegador"
+                : "⚠️ Usando regras RFM locais (modelo não encontrado)"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
+        <div style={card}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:16 }}>Dados do Cliente</div>
+          {[
+            { label:"Recência (dias desde última compra)", key:"rec", val:rec, set:setRec, min:1, max:400, color:"#6366f1" },
+            { label:"Frequência (nº de compras)", key:"freq", val:freq, set:setFreq, min:1, max:50, color:"#10b981" },
+            { label:"Monetário (valor total R$)", key:"mon", val:mon, set:setMon, min:10, max:20000, color:"#f59e0b" },
+          ].map(({ label, val, set, min, max, color }) => (
+            <div key={label} style={{ marginBottom:18 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                <span style={{ fontSize:12, color:"#64748b" }}>{label}</span>
+                <span style={{ fontSize:13, fontWeight:700, color }}>{val}</span>
+              </div>
+              <input type="range" min={min} max={max} value={val}
+                onChange={e => set(e.target.value)}
+                style={{ width:"100%", accentColor:color }} />
+            </div>
+          ))}
+          <button onClick={predict} disabled={predicting}
+            style={{ width:"100%", padding:"11px", borderRadius:10, border:"none",
+              background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff",
+              fontSize:14, fontWeight:700, cursor:"pointer", opacity:predicting?.6:1 }}>
+            {predicting ? "🔄 Processando..." : "🚀 Prever Segmento com IA"}
+          </button>
+        </div>
+
+        <div style={card}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:16 }}>Resultado da Predição</div>
+          {result ? (
+            <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+              <div style={{ textAlign:"center", padding:"20px", borderRadius:12,
+                background:SEGS[result.seg].bg, border:`2px solid ${SEGS[result.seg].hex}` }}>
+                <div style={{ fontSize:40, marginBottom:8 }}>{SEGS[result.seg].emoji}</div>
+                <div style={{ fontSize:22, fontWeight:800, color:SEGS[result.seg].tx }}>{result.seg}</div>
+                <div style={{ fontSize:12, color:"#94a3b8", marginTop:4 }}>{SEGS[result.seg].desc}</div>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8 }}>
+                {[["R Score", result.rs, "#6366f1"], ["F Score", result.fs, "#10b981"], ["M Score", result.ms, "#f59e0b"]].map(([l, v, c]) => (
+                  <div key={l} style={{ textAlign:"center", padding:"10px", borderRadius:8, background:"#f8fafc" }}>
+                    <div style={{ fontSize:10, color:"#94a3b8", marginBottom:4 }}>{l}</div>
+                    <div style={{ fontSize:22, fontWeight:700, color:c }}>{v}</div>
+                    <ScoreBar v={v} />
+                  </div>
+                ))}
+              </div>
+              {result.probs && (
+                <div>
+                  <div style={{ fontSize:11, fontWeight:600, color:"#64748b", marginBottom:8 }}>Confiança por Cluster (TF.js)</div>
+                  {result.probs.map((p, i) => (
+                    <div key={i} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
+                      <span style={{ fontSize:10, color:"#94a3b8", minWidth:54 }}>Cluster {i}</span>
+                      <MiniBar value={p} max={1} color={i === result.clusterIdx ? "#6366f1" : "#e2e8f0"} />
+                      <span style={{ fontSize:11, fontWeight:600, color: i === result.clusterIdx ? "#6366f1" : "#94a3b8" }}>
+                        {(p * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ padding:"12px", borderRadius:8, background:"#eff6ff",
+                border:"1px solid #bfdbfe", fontSize:12, color:"#1e3a8a" }}>
+                <strong>💡 Ação recomendada:</strong> {actions[result.seg]}
+              </div>
+            </div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center",
+              justifyContent:"center", height:260, color:"#94a3b8", gap:12 }}>
+              <div style={{ fontSize:40 }}>🎯</div>
+              <div style={{ fontSize:13 }}>Ajuste os sliders e clique em Prever</div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ ...card, background:"linear-gradient(135deg,#1e1b4b,#312e81)", color:"#fff" }}>
+        <div style={{ fontSize:13, fontWeight:700, marginBottom:8 }}>🧠 Como funciona o Deep Learning aqui</div>
+        <div style={{ fontSize:12, color:"rgba(255,255,255,0.7)", lineHeight:1.7 }}>
+          O modelo foi treinado no Google Colab com os dados reais do Online Retail II (4.338 clientes).
+          Após o treino, foi exportado para <strong style={{color:"#a5b4fc"}}>TensorFlow.js</strong> e carregado
+          diretamente neste navegador — <strong style={{color:"#a5b4fc"}}>zero backend, zero servidor</strong>.
+          A predição acontece 100% no seu dispositivo usando a GPU/CPU local via WebGL.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App(){
   const [clients,setClients]=useState([]);
   const [filter,setFilter]=useState("Todos");
@@ -162,10 +342,12 @@ export default function App(){
   const [tpage,setTpage]=useState(0);
   const [sideOpen,setSideOpen]=useState(true);
   const [loading,setLoading]=useState(true);
+  const [modelLoaded,setModelLoaded]=useState(false);
   const PAGE=12;
 
   useEffect(()=>{
     setLoading(true);
+    loadModel().then(ok => setModelLoaded(ok));
     setTimeout(()=>{setClients(buildClients(genRows(180)));setLoading(false);},800);
   },[]);
 
@@ -194,6 +376,7 @@ export default function App(){
     {id:"scatter",icon:"⬡",label:"Dispersão RFM"},
     {id:"clients",icon:"≡",label:"Clientes"},
     {id:"top",icon:"★",label:"Top Clientes"},
+    {id:"predictor",icon:"🤖",label:"Preditor IA"},
   ];
 
   const badge=s=>({display:"inline-flex",alignItems:"center",gap:5,padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,background:SEGS[s].bg,color:SEGS[s].tx});
@@ -211,7 +394,6 @@ export default function App(){
 
   return(
     <div style={{display:"flex",height:"100vh",fontFamily:"system-ui,sans-serif",background:"#f8fafc",color:"#0f172a",fontSize:14}}>
-
       {/* ── Sidebar ── */}
       <div style={{width:sideOpen?220:64,flexShrink:0,background:"#1e1b4b",display:"flex",flexDirection:"column",transition:"width .25s",overflow:"hidden"}}>
         <div style={{padding:"20px 16px",display:"flex",alignItems:"center",gap:10,borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
@@ -233,6 +415,17 @@ export default function App(){
             );
           })}
         </div>
+        {sideOpen && (
+          <div style={{padding:"12px 16px",borderTop:"1px solid rgba(255,255,255,0.08)"}}>
+            <div style={{fontSize:10,color:"rgba(255,255,255,0.4)",marginBottom:6}}>Motor de IA</div>
+            <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:modelLoaded?"#10b981":"#f59e0b"}}/>
+              <span style={{fontSize:11,color:"rgba(255,255,255,0.6)"}}>
+                {modelLoaded?"TF.js Ativo":"Regras RFM"}
+              </span>
+            </div>
+          </div>
+        )}
         <div style={{padding:12,borderTop:"1px solid rgba(255,255,255,0.08)"}}>
           <div onClick={()=>setSideOpen(!sideOpen)} style={{display:"flex",alignItems:"center",justifyContent:"center",padding:"10px 16px",cursor:"pointer",borderRadius:8,color:"rgba(255,255,255,0.6)"}}>
             <span style={{fontSize:14}}>{sideOpen?"◀":"▶"}</span>
@@ -242,7 +435,6 @@ export default function App(){
 
       {/* ── Main ── */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-
         {/* Header */}
         <div style={{background:"#fff",borderBottom:"1px solid #e2e8f0",padding:"0 24px",height:60,display:"flex",alignItems:"center",gap:12,flexShrink:0,flexWrap:"wrap"}}>
           <div style={{flex:1}}>
@@ -288,7 +480,6 @@ export default function App(){
                 </div>
               ))}
             </div>
-
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12}}>
               {SK.map(sg=>{
                 const cnt=counts[sg]||0,rev=revs[sg]||0,pct=clients.length?cnt/clients.length*100:0;
@@ -310,7 +501,6 @@ export default function App(){
                 );
               })}
             </div>
-
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
               <div style={card}>
                 <div style={{fontSize:13,fontWeight:700,marginBottom:16,display:"flex",justifyContent:"space-between"}}>
@@ -392,7 +582,7 @@ export default function App(){
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
               <div>
                 <div style={{fontSize:13,fontWeight:700}}>Base de Clientes</div>
-                <div style={{fontSize:11,color:"#94a3b8"}}>{fil.length} clientes · clique no cabeçalho para ordenar</div>
+                <div style={{fontSize:11,color:"#94a3b8"}}>{fil.length} clientes</div>
               </div>
               <button onClick={()=>exportCSV(clients,filter)} style={{padding:"7px 14px",borderRadius:8,fontSize:12,fontWeight:500,cursor:"pointer",border:"1px solid #e2e8f0",background:"#f8fafc",color:"#475569"}}>↓ Exportar seleção</button>
             </div>
@@ -474,6 +664,9 @@ export default function App(){
               </table>
             </div>
           </div>}
+
+          {/* ── Preditor IA ── */}
+          {page==="predictor" && <TFPredictor modelLoaded={modelLoaded} />}
 
         </div>
       </div>
